@@ -1,6 +1,6 @@
 # bb-attach
 
-Upload images to **Bitbucket Cloud** pull requests and comments from the command line, and get a URL you can drop straight into Markdown.
+Upload images — and videos, converted to GIF — to **Bitbucket Cloud** pull requests and comments from the command line, and get a URL you can drop straight into Markdown.
 
 The Bitbucket equivalent of [`gh-attach`](https://github.com/sudosubin/gh-attach).
 
@@ -20,6 +20,8 @@ chmod +x ~/.local/bin/bb-attach   # make sure ~/.local/bin is on your PATH
 
 Requires Python 3.7+ and a browser (Chrome/Firefox/Safari/Edge/Brave) logged in to bitbucket.org.
 
+Videos also need [`ffmpeg`](https://ffmpeg.org/) on your PATH (e.g. `brew install ffmpeg`).
+
 ## Usage
 
 ```bash
@@ -28,22 +30,29 @@ bb-attach -m shot.png                    # ![name](url) Markdown, ready to paste
 bb-attach --json a.png b.png             # JSON array
 bb-attach --repo myworkspace/myrepo x.png   # specify repo explicitly
 bb-attach --browser firefox x.png        # cookie source browser (default: chrome)
+bb-attach -m demo.mp4                    # video → GIF, then upload (the endpoint accepts images only)
 ```
 
 Paste the printed URL (or the `-m` Markdown) into any PR description or comment — it renders inline, exactly like a web-UI upload.
+
+The URL looks like `https://bitbucket.org/%7B%7D/%7B<repo-uuid>%7D/images/<n>-<name>` — the empty `{}` workspace segment is normal, not a broken link.
+
+Each file is handled on its own: if one fails, the rest still upload. Failures go to stderr (or as `{"file", "error"}` entries with `--json`), and the exit code is 1 if any file failed.
 
 ## How it works
 
 1. Resolve `workspace/repo` from `--repo` or the `git origin` remote.
 2. Read `bitbucket.org` session cookies from your browser via [`browser-cookie3`](https://github.com/borisbabic/browser_cookie3).
-3. `POST` the file (multipart, field `file`) to `https://bitbucket.org/xhr/{workspace}/{repo}/image-upload/` with the `X-CSRFToken` header set from the `csrftoken` cookie.
-4. Print the `href` from the JSON response.
+3. If the file is a video (mp4/mov/webm/mkv/m4v), convert it to GIF with ffmpeg (two-pass palettegen, 8 fps, at most 1100 px wide). The original video is not uploaded anywhere.
+4. `POST` the file (multipart, field `file`) to `https://bitbucket.org/xhr/{workspace}/{repo}/image-upload/` with the `X-CSRFToken` header set from the `csrftoken` cookie.
+5. Print the `href` from the JSON response.
 
 ## Privacy & caveats
 
 - **Reads your browser cookies.** Cookies are held in memory and sent only to `bitbucket.org` over HTTPS — never written to disk or logged. This is the same mechanism `gh-attach` uses for GitHub.
 - **Uses an undocumented endpoint.** If Atlassian changes it, this breaks. The tool fails loudly (non-zero exit) rather than emitting a wrong URL if the response shape changes.
 - Uploaded images inherit the **repository's** access level (private repo → viewers need repo read access).
+- **Images only on the server side.** The endpoint rejects videos with HTTP 400 `File must be an image.`, hence the GIF conversion. Long videos make large GIFs and may hit Bitbucket's upload size limit — trim them first.
 
 ## License
 
