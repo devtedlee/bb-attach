@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# bb-attach — Bitbucket Cloud 이미지 업로더 (sudosubin/gh-attach 의 Bitbucket 판).
+# bb-attach — Bitbucket Cloud 이미지·영상(영상은 GIF로 변환) 업로더 (sudosubin/gh-attach 의 Bitbucket 판).
 #
 # 브라우저 세션 쿠키로 웹 UI가 쓰는 비공개 엔드포인트를 호출해 이미지를 올리고,
 # PR 설명·댓글에 그대로 박을 수 있는 URL을 반환한다. 공개 REST API(api.bitbucket.org)로는
@@ -8,14 +8,15 @@
 # ponytail: 비공개 엔드포인트 /xhr/{ws}/{repo}/image-upload/ 에 의존한다 —
 #   Atlassian이 바꾸면 깨진다. 응답에 href 없으면 즉시 실패시켜 '조용한 깨짐'을 막는다.
 #   업그레이드 경로: 공개 PR-attachment API가 나오면 그쪽으로 교체.
+# ponytail: image-upload는 이미지만 받아(영상은 400 "File must be an image.") 영상은 GIF 변환 후 올린다 — 사용자 결정, 원본 mp4는 올리지 않는다.
 #
 # Usage:
-#   bb-attach img.png [img2.png ...]         # URL 출력
+#   bb-attach img.png [demo.mp4 ...]         # URL 출력 (영상은 GIF로 변환 후 업로드)
 #   bb-attach -m img.png                     # ![name](url) 마크다운 출력
 #   bb-attach --json img.png                 # JSON 출력
 #   bb-attach --repo ws/repo img.png         # repo 명시 (기본: git origin 에서 추론)
 #   bb-attach --browser firefox img.png      # 쿠키 소스 브라우저 (기본 chrome)
-import argparse, json, mimetypes, os, re, subprocess, sys, urllib.error, urllib.request, uuid
+import argparse, json, mimetypes, os, re, shutil, subprocess, sys, tempfile, urllib.error, urllib.request, uuid
 
 ENDPOINT = "https://bitbucket.org/xhr/{ws}/{repo}/image-upload/"
 
@@ -52,9 +53,35 @@ def get_cookies(browser):
     return cookies
 
 
+VIDEO_EXT = (".mp4", ".mov", ".webm", ".mkv", ".m4v")
+
+
+def is_video(path):
+    return (mimetypes.guess_type(path)[0] or "").startswith("video/") or path.lower().endswith(VIDEO_EXT)
+
+
+def to_gif(path, tmp):
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg 필요 — brew install ffmpeg")
+    gif = os.path.join(tmp, os.path.splitext(os.path.basename(path))[0] + ".gif")
+    vf = "fps=8,scale='min(1100,iw)':-1:flags=lanczos"
+    pal = os.path.join(tmp, "palette.png")
+    base = ["ffmpeg", "-v", "error", "-y", "-i", path]
+    try:
+        subprocess.run(base + ["-vf", vf + ",palettegen", pal], check=True, capture_output=True, text=True)
+        subprocess.run(base + ["-i", pal, "-lavfi", vf + "[x];[x][1:v]paletteuse", gif],
+                       check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"GIF 변환 실패: {e.stderr.strip()[:300]}")
+    return gif
+
+
 def upload(ws, repo, path, cookies):
     if not os.path.isfile(path):
-        sys.exit(f"파일 없음: {path}")
+        raise RuntimeError(f"파일 없음: {path}")
+    if is_video(path):
+        with tempfile.TemporaryDirectory() as tmp:
+            return upload(ws, repo, to_gif(path, tmp), cookies)
     fname = os.path.basename(path)
     ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
     with open(path, "rb") as f:
@@ -84,20 +111,20 @@ def upload(ws, repo, path, cookies):
         raw = urllib.request.urlopen(req).read()
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:300]
-        sys.exit(f"업로드 실패 HTTP {e.code} — {detail}\n(세션 만료 시 브라우저에서 재로그인)")
+        raise RuntimeError(f"업로드 실패 HTTP {e.code} — {detail}\n(세션 만료 시 브라우저에서 재로그인)")
     try:
         out = json.loads(raw)
     except ValueError:
-        sys.exit(f"응답이 JSON 아님(엔드포인트 변경 의심): {raw[:200]!r}")
+        raise RuntimeError(f"응답이 JSON 아님(엔드포인트 변경 의심): {raw[:200]!r}")
     href = out.get("href")
     if not href:  # ponytail: 엔드포인트 스펙 변경 시 조용히 잘못된 URL 뱉는 것 방지
-        sys.exit(f"응답에 href 없음(엔드포인트 변경 의심): {out}")
+        raise RuntimeError(f"응답에 href 없음(엔드포인트 변경 의심): {out}")
     return href, out.get("filename", fname)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Bitbucket Cloud 이미지 첨부 업로더 (gh-attach 의 bb 판)")
-    ap.add_argument("files", nargs="+", help="업로드할 이미지 파일")
+    ap = argparse.ArgumentParser(description="Bitbucket Cloud 이미지·영상(영상은 GIF로 변환) 첨부 업로더 (gh-attach 의 bb 판)")
+    ap.add_argument("files", nargs="+", help="업로드할 이미지·영상 파일 (영상은 GIF로 변환)")
     ap.add_argument("--repo", help="workspace/repo (기본: git origin 에서 추론)")
     ap.add_argument("--browser", default="chrome",
                     choices=["chrome", "firefox", "safari", "edge", "brave"],
@@ -108,13 +135,22 @@ def main():
 
     ws, repo = resolve_repo(a.repo)
     cookies = get_cookies(a.browser)
-    results = [dict(zip(("href", "filename"), upload(ws, repo, p, cookies)), file=p) for p in a.files]
-
+    results, failed = [], False
+    for p in a.files:
+        try:
+            r = dict(zip(("href", "filename"), upload(ws, repo, p, cookies)), file=p)
+            if is_video(p):
+                r["converted_from"] = p
+            results.append(r)
+            if not a.json:
+                print(f"![{r['filename']}]({r['href']})" if a.markdown else r["href"])
+        except RuntimeError as e:
+            failed = True
+            results.append({"file": p, "error": str(e)})
+            print(f"{p}: {e}", file=sys.stderr)
     if a.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
-    else:
-        for r in results:
-            print(f"![{r['filename']}]({r['href']})" if a.markdown else r["href"])
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":
